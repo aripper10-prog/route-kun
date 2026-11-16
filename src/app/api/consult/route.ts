@@ -1,4 +1,3 @@
-
 import { NextResponse } from "next/server";
 import {
   checkSecurity,
@@ -7,6 +6,9 @@ import {
   createRestPriorityConsult,
   SECURITY_SYSTEM_GUARD,
 } from "@/lib/guard";
+
+// Vercelのデフォルト10秒タイムアウトを回避
+export const maxDuration = 30;
 
 const GEMINI_API_URL =
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
@@ -52,13 +54,33 @@ export async function POST(req: Request) {
     );
   }
 
+  // 2. 不正なJSONやオブジェクト以外のボディを 400 Bad Request で弾く
+  let body: Record<string, unknown>;
   try {
-    const body = await req.json();
+    const parsedBody = await req.json();
+    if (!parsedBody || typeof parsedBody !== "object" || Array.isArray(parsedBody)) {
+      return NextResponse.json(
+        { error: "リクエスト形式が正しくありません。" },
+        { status: 400 }
+      );
+    }
+    body = parsedBody as Record<string, unknown>;
+  } catch {
+    return NextResponse.json(
+      { error: "JSONの解析に失敗しました。" },
+      { status: 400 }
+    );
+  }
 
-    // 2. 入力データの無害化（タグ除去＋文字数制限）
-    const question = sanitizeUserText(body.question, 200);
-    const goalInput = sanitizeUserText(body.goalInput, 100);
-    const obstacle = sanitizeUserText(body.obstacle, 150);
+  try {
+    // 3. 入力データの型チェック＋無害化（タグ除去＋文字数制限）
+    const rawQuestion = typeof body.question === "string" ? body.question : "";
+    const rawGoal = typeof body.goalInput === "string" ? body.goalInput : "";
+    const rawObstacle = typeof body.obstacle === "string" ? body.obstacle : "";
+
+    const question = sanitizeUserText(rawQuestion, 200);
+    const goalInput = sanitizeUserText(rawGoal, 100);
+    const obstacle = sanitizeUserText(rawObstacle, 150);
 
     if (!question) {
       return NextResponse.json(
@@ -67,37 +89,72 @@ export async function POST(req: Request) {
       );
     }
 
-    // 3. 限界サイン検知時はAIを通さず「休息の提示」を即座に返す
-    if (needsImmediateRest(question)) {
+    // 4. 限界サイン検知時はAIを通さず「休息の提示」を即座に返す（壁・目標も含めて判定）
+    if (needsImmediateRest(question, goalInput, obstacle)) {
       return NextResponse.json(createRestPriorityConsult());
     }
 
-    // ルート情報も改ざん対策としてサニタイズ
+    // ルート情報も改ざん対策としてサニタイズ（配列を除外し、ネストプロパティの型も確認）
     const rawRoute =
-      typeof body.routeData === "object" && body.routeData !== null
-        ? body.routeData
+      typeof body.routeData === "object" &&
+      body.routeData !== null &&
+      !Array.isArray(body.routeData)
+        ? (body.routeData as Record<string, unknown>)
         : null;
-    const summitVision = sanitizeUserText(rawRoute?.summit_vision, 100);
-    const planAAction = sanitizeUserText(rawRoute?.plan_a?.action, 100);
-    const planBMicroAction = sanitizeUserText(rawRoute?.plan_b_micro?.action, 100);
 
-    // 過去の相談履歴（直近4件）もすべて無害化
+    const rawPlanA =
+      typeof rawRoute?.plan_a === "object" &&
+      rawRoute.plan_a !== null &&
+      !Array.isArray(rawRoute.plan_a)
+        ? (rawRoute.plan_a as Record<string, unknown>)
+        : null;
+
+    const rawPlanBMicro =
+      typeof rawRoute?.plan_b_micro === "object" &&
+      rawRoute.plan_b_micro !== null &&
+      !Array.isArray(rawRoute.plan_b_micro)
+        ? (rawRoute.plan_b_micro as Record<string, unknown>)
+        : null;
+
+    const summitVision = sanitizeUserText(
+      typeof rawRoute?.summit_vision === "string" ? rawRoute.summit_vision : "",
+      100
+    );
+    const planAAction = sanitizeUserText(
+      typeof rawPlanA?.action === "string" ? rawPlanA.action : "",
+      100
+    );
+    const planBMicroAction = sanitizeUserText(
+      typeof rawPlanBMicro?.action === "string" ? rawPlanBMicro.action : "",
+      100
+    );
+
+    // 過去の相談履歴（直近4件）もすべて型チェック＋無害化
     const rawHistory: unknown[] = Array.isArray(body.history)
       ? body.history.slice(-4)
       : [];
     const safeHistory: ConsultHistoryItem[] = rawHistory
       .filter(
         (item): item is Record<string, unknown> =>
-          typeof item === "object" && item !== null
+          typeof item === "object" && item !== null && !Array.isArray(item)
       )
       .map((item) => ({
-        question: sanitizeUserText(item.question, 200),
-        advice: sanitizeUserText(item.advice, 300),
-        concrete_action: sanitizeUserText(item.concrete_action, 200),
+        question: sanitizeUserText(
+          typeof item.question === "string" ? item.question : "",
+          200
+        ),
+        advice: sanitizeUserText(
+          typeof item.advice === "string" ? item.advice : "",
+          300
+        ),
+        concrete_action: sanitizeUserText(
+          typeof item.concrete_action === "string" ? item.concrete_action : "",
+          200
+        ),
       }))
       .filter((item) => item.question.length > 0);
 
-    // 4. 最優先の防御プロンプトを先頭に配置
+    // 5. 最優先の防御プロンプトを先頭に配置（行頭のゼロ幅スペース除去済み）
     const systemInstruction = `${SECURITY_SYSTEM_GUARD}
 
 あなたは焦燥・迷走思考整理ツール「るーと君」の登山ガイドです。
@@ -108,7 +165,7 @@ export async function POST(req: Request) {
 2. 抽象的な精神論（「頑張ろう」「調べてみよう」だけ）は禁止です。
 3. concrete_action（こうしたらいいよ！）には、スマホでそのまま打ち込める検索ワード、そのまま使える相談テンプレート、1分で終わる超具体的な手順など「迷わず動ける具体策」を必ず書いてください。`;
 
-    // 5. ユーザー由来のデータをすべて <user_input> タグ内に隔離
+    // 6. ユーザー由来のデータをすべて <user_input> タグ内に隔離（バックスラッシュ修正済み）
     const historyBlock =
       safeHistory.length > 0
         ? safeHistory
@@ -123,8 +180,9 @@ export async function POST(req: Request) {
   <current_route>
     <goal>${goalInput || "未設定"}</goal>
     <obstacle>${obstacle || "特になし"}</obstacle>
-    ${summitVision ? `<summit_vision>\${summitVision}</summit_vision>` : ""}
-    ${planAAction ? `<plan_a>${planAAction}</plan_a>` : ""} ${planBMicroAction ? `<plan_b_micro>${planBMicroAction}</plan_b_micro>` : ""}
+    ${summitVision ? `<summit_vision>${summitVision}</summit_vision>` : ""}
+    ${planAAction ? `<plan_a>${planAAction}</plan_a>` : ""}
+    ${planBMicroAction ? `<plan_b_micro>${planBMicroAction}</plan_b_micro>` : ""}
   </current_route>
   <history>
 ${historyBlock}
@@ -132,9 +190,14 @@ ${historyBlock}
   <new_question>${question}</new_question>
 </user_input>`;
 
-    const res = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
+    // 7. APIキーはヘッダーで渡し、25秒でタイムアウト制御
+    const res = await fetch(GEMINI_API_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      signal: AbortSignal.timeout(25000),
       body: JSON.stringify({
         systemInstruction: {
           parts: [{ text: systemInstruction }],
@@ -149,6 +212,7 @@ ${historyBlock}
           temperature: 0.7,
           responseMimeType: "application/json",
           responseSchema: consultSchema,
+          thinkingConfig: { thinkingBudget: 0 },
         },
       }),
     });
@@ -175,6 +239,14 @@ ${historyBlock}
     const parsed = JSON.parse(rawText);
     return NextResponse.json(parsed);
   } catch (err) {
+    if (err instanceof Error && err.name === "TimeoutError") {
+      console.error("Gemini Consult API Timeout");
+      return NextResponse.json(
+        { error: "回答の生成に時間がかかりすぎています。もう一度お試しください。" },
+        { status: 504 }
+      );
+    }
+
     console.error("Consult Handler Error:", err);
     return NextResponse.json(
       { error: "予期しないエラーが発生しました。" },
