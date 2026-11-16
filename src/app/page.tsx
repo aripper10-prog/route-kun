@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 
 interface CheckpointItem {
   stage: string;
@@ -52,6 +52,7 @@ const STORAGE_KEY = "route_kun_mountain_v3";
 const MAX_GOAL_LENGTH = 100;
 const MAX_OBSTACLE_LENGTH = 150;
 const MAX_CONSULT_LENGTH = 200;
+const CLIENT_TIMEOUT_MS = 30000;
 
 const GOAL_PRESETS = [
   "就労移行事業所に通う",
@@ -73,6 +74,83 @@ const CONSULT_PRESETS = [
   "不安で手が止まる時はどうしたらいい？",
   "もっと負荷を下げたやり方を教えて",
 ];
+
+// localStorageやAPIレスポンスの構造が壊れていないか検証する型ガード
+function isValidRouteData(data: unknown): data is RouteData {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+  const d = data as Record<string, unknown>;
+
+  if (
+    typeof d.empathy_message !== "string" ||
+    typeof d.summit_vision !== "string" ||
+    !Array.isArray(d.checkpoints) ||
+    d.checkpoints.length < 3
+  ) {
+    return false;
+  }
+
+  const checkpointsValid = d.checkpoints.every((cp) => {
+    if (!cp || typeof cp !== "object") return false;
+    const c = cp as Record<string, unknown>;
+    return (
+      typeof c.stage === "string" &&
+      typeof c.title === "string" &&
+      typeof c.detail === "string"
+    );
+  });
+  if (!checkpointsValid) return false;
+
+  const planA = d.plan_a as Record<string, unknown> | undefined;
+  const planBMicro = d.plan_b_micro as Record<string, unknown> | undefined;
+  const planBRest = d.plan_b_rest as Record<string, unknown> | undefined;
+
+  return (
+    typeof planA?.action === "string" &&
+    typeof planA?.duration === "string" &&
+    typeof planBMicro?.action === "string" &&
+    typeof planBMicro?.reason === "string" &&
+    typeof planBRest?.action === "string" &&
+    typeof planBRest?.reason === "string"
+  );
+}
+
+function isValidConsultEntry(item: unknown): item is ConsultEntry {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+  const e = item as Record<string, unknown>;
+  return (
+    typeof e.id === "string" &&
+    typeof e.question === "string" &&
+    typeof e.advice === "string" &&
+    typeof e.concrete_action === "string" &&
+    typeof e.action_tip === "string"
+  );
+}
+
+// HTMLエラーページ等でもクラッシュしない安全なJSONパーサー
+async function parseJsonSafely(res: Response): Promise<Record<string, unknown>> {
+  const text = await res.text();
+  if (!text) return {};
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    return {};
+  } catch {
+    throw new Error(
+      `サーバーの応答を正しく読み取れませんでした（ステータス: ${res.status}）。少し時間をおいて再試行してください。`
+    );
+  }
+}
+
+// 日本語変換（IME）確定時のEnter誤送信を判定
+function isConfirmedEnterKey(e: React.KeyboardEvent<HTMLInputElement>): boolean {
+  return (
+    e.key === "Enter" &&
+    !e.nativeEvent.isComposing &&
+    e.keyCode !== 229
+  );
+}
 
 function ClimbArrowUp({ label }: { label?: string }) {
   return (
@@ -123,27 +201,58 @@ export default function RouteKunPage() {
   const [consultLoading, setConsultLoading] = useState(false);
   const [consultError, setConsultError] = useState<string | null>(null);
 
+  // ダブルクリック等の瞬間的な二重送信を防ぐ同期ロック
+  const isGeneratingRef = useRef(false);
+  const isConsultingRef = useRef(false);
+
+  // リセット・再送信・タイムアウト時に通信を中断するためのコントローラー
+  const generateAbortRef = useRef<AbortController | null>(null);
+  const consultAbortRef = useRef<AbortController | null>(null);
+
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        const saved: SavedState = JSON.parse(raw);
-        if (saved.goalInput) setGoalInput(saved.goalInput.slice(0, MAX_GOAL_LENGTH));
-        if (saved.obstacleInput) {
+        const saved = JSON.parse(raw) as Partial<SavedState>;
+        if (typeof saved.goalInput === "string") {
+          setGoalInput(saved.goalInput.slice(0, MAX_GOAL_LENGTH));
+        }
+        if (typeof saved.obstacleInput === "string") {
           setObstacleInput(saved.obstacleInput.slice(0, MAX_OBSTACLE_LENGTH));
         }
-        if (saved.routeData) setRouteData(saved.routeData);
-        if (saved.branch) setBranch(saved.branch);
-        if (saved.completed) setCompleted(saved.completed);
+        if (isValidRouteData(saved.routeData)) {
+          setRouteData(saved.routeData);
+        }
+        if (
+          saved.branch === "none" ||
+          saved.branch === "plan_a" ||
+          saved.branch === "plan_b"
+        ) {
+          setBranch(saved.branch);
+        }
+        if (
+          saved.completed === "none" ||
+          saved.completed === "plan_a" ||
+          saved.completed === "b_micro" ||
+          saved.completed === "b_rest"
+        ) {
+          setCompleted(saved.completed);
+        }
         if (Array.isArray(saved.consultHistory)) {
-          setConsultHistory(saved.consultHistory);
+          setConsultHistory(saved.consultHistory.filter(isValidConsultEntry));
         }
       }
     } catch {
-      // ignore
+      // 破損データがあった場合は安全に破棄して初期化
+      localStorage.removeItem(STORAGE_KEY);
     } finally {
       setHydrated(true);
     }
+
+    return () => {
+      generateAbortRef.current?.abort("unmount");
+      consultAbortRef.current?.abort("unmount");
+    };
   }, []);
 
   useEffect(() => {
@@ -195,7 +304,15 @@ export default function RouteKunPage() {
   ) => {
     const trimmedGoal = targetGoal.trim().slice(0, MAX_GOAL_LENGTH);
     const trimmedObstacle = targetObstacle.trim().slice(0, MAX_OBSTACLE_LENGTH);
-    if (!trimmedGoal || loading) return;
+    if (!trimmedGoal || isGeneratingRef.current || loading) return;
+
+    isGeneratingRef.current = true;
+    generateAbortRef.current?.abort("superseded");
+    consultAbortRef.current?.abort("superseded");
+
+    const controller = new AbortController();
+    generateAbortRef.current = controller;
+    const timeoutId = setTimeout(() => controller.abort("timeout"), CLIENT_TIMEOUT_MS);
 
     setLoading(true);
     setError(null);
@@ -208,6 +325,7 @@ export default function RouteKunPage() {
       const res = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           goalInput: trimmedGoal,
           obstacle: trimmedObstacle,
@@ -215,23 +333,48 @@ export default function RouteKunPage() {
         }),
       });
 
-      const data = await res.json();
+      const data = await parseJsonSafely(res);
       if (!res.ok) {
-        throw new Error(data.error || "登山ルートの作成に失敗しました。");
+        throw new Error(
+          typeof data.error === "string"
+            ? data.error
+            : "登山ルートの作成に失敗しました。"
+        );
+      }
+
+      if (!isValidRouteData(data)) {
+        throw new Error("受信したルートデータの形式が正しくありません。再度お試しください。");
       }
 
       setRouteData(data);
       setIsDetourOpen(false);
     } catch (err) {
+      if (controller.signal.aborted) {
+        if (controller.signal.reason === "timeout") {
+          setError("通信がタイムアウトしました。電波状況をご確認のうえ再試行してください。");
+        }
+        return;
+      }
       setError(err instanceof Error ? err.message : "通信エラーが発生しました。");
     } finally {
-      setLoading(false);
+      clearTimeout(timeoutId);
+      if (generateAbortRef.current === controller) {
+        isGeneratingRef.current = false;
+        setLoading(false);
+      }
     }
   };
 
   const handleAskConsult = async (targetQuestion: string) => {
     const trimmedQ = targetQuestion.trim().slice(0, MAX_CONSULT_LENGTH);
-    if (!trimmedQ || !routeData || consultLoading) return;
+    if (!trimmedQ || !routeData || isConsultingRef.current || consultLoading) return;
+
+    isConsultingRef.current = true;
+    consultAbortRef.current?.abort("superseded");
+
+    const controller = new AbortController();
+    consultAbortRef.current = controller;
+    const timeoutId = setTimeout(() => controller.abort("timeout"), CLIENT_TIMEOUT_MS);
 
     setConsultLoading(true);
     setConsultError(null);
@@ -240,6 +383,7 @@ export default function RouteKunPage() {
       const res = await fetch("/api/consult", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           question: trimmedQ,
           goalInput: goalInput.trim().slice(0, MAX_GOAL_LENGTH),
@@ -253,9 +397,18 @@ export default function RouteKunPage() {
         }),
       });
 
-      const data = await res.json();
+      const data = await parseJsonSafely(res);
       if (!res.ok) {
-        throw new Error(data.error || "回答の取得に失敗しました。");
+        throw new Error(
+          typeof data.error === "string" ? data.error : "回答の取得に失敗しました。"
+        );
+      }
+
+      if (
+        typeof data.advice !== "string" ||
+        typeof data.concrete_action !== "string"
+      ) {
+        throw new Error("回答データの形式が正しくありませんでした。");
       }
 
       const newEntry: ConsultEntry = {
@@ -263,17 +416,27 @@ export default function RouteKunPage() {
         question: trimmedQ,
         advice: data.advice,
         concrete_action: data.concrete_action,
-        action_tip: data.action_tip,
+        action_tip: typeof data.action_tip === "string" ? data.action_tip : "",
       };
 
       setConsultHistory((prev) => [...prev, newEntry]);
       setConsultInput("");
     } catch (err) {
+      if (controller.signal.aborted) {
+        if (controller.signal.reason === "timeout") {
+          setConsultError("通信がタイムアウトしました。もう一度お試しください。");
+        }
+        return;
+      }
       setConsultError(
         err instanceof Error ? err.message : "通信エラーが発生しました。"
       );
     } finally {
-      setConsultLoading(false);
+      clearTimeout(timeoutId);
+      if (consultAbortRef.current === controller) {
+        isConsultingRef.current = false;
+        setConsultLoading(false);
+      }
     }
   };
 
@@ -284,6 +447,16 @@ export default function RouteKunPage() {
   };
 
   const handleClear = () => {
+    // 進行中のAPI通信を即座にキャンセルして、リセット後の画面書き戻しを防止
+    generateAbortRef.current?.abort("reset");
+    consultAbortRef.current?.abort("reset");
+    generateAbortRef.current = null;
+    consultAbortRef.current = null;
+    isGeneratingRef.current = false;
+    isConsultingRef.current = false;
+
+    setLoading(false);
+    setConsultLoading(false);
     setGoalInput("");
     setObstacleInput("");
     setRouteData(null);
@@ -317,7 +490,7 @@ export default function RouteKunPage() {
             </div>
           </div>
 
-          {(routeData || goalInput || obstacleInput) && (
+          {(routeData || goalInput || obstacleInput || loading) && (
             <button
               type="button"
               onClick={handleClear}
@@ -343,7 +516,7 @@ export default function RouteKunPage() {
               value={goalInput}
               onChange={(e) => setGoalInput(e.target.value.slice(0, MAX_GOAL_LENGTH))}
               onKeyDown={(e) => {
-                if (e.key === "Enter") {
+                if (isConfirmedEnterKey(e)) {
                   e.preventDefault();
                   generateRoute(goalInput, obstacleInput, false);
                 }
@@ -400,7 +573,7 @@ export default function RouteKunPage() {
                 setObstacleInput(e.target.value.slice(0, MAX_OBSTACLE_LENGTH))
               }
               onKeyDown={(e) => {
-                if (e.key === "Enter") {
+                if (isConfirmedEnterKey(e)) {
                   e.preventDefault();
                   generateRoute(goalInput, obstacleInput, false);
                 }
@@ -458,8 +631,9 @@ export default function RouteKunPage() {
             <p className="text-sm">{error}</p>
             <button
               type="button"
+              disabled={loading || !goalInput.trim()}
               onClick={() => generateRoute(goalInput, obstacleInput, false)}
-              className="shrink-0 text-xs font-semibold bg-white border border-rose-200 hover:bg-rose-100 px-3 py-1.5 rounded-lg transition cursor-pointer"
+              className="shrink-0 text-xs font-semibold bg-white border border-rose-200 hover:bg-rose-100 disabled:opacity-50 px-3 py-1.5 rounded-lg transition cursor-pointer"
             >
               再試行
             </button>
@@ -485,425 +659,3 @@ export default function RouteKunPage() {
                       <span>
                         🚧 考慮中の壁：<strong>{obstacleInput}</strong>
                       </span>
-                    ) : (
-                      <span>「でも〇〇ができない…」という事情がありますか？</span>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setIsDetourOpen(true)}
-                    className="shrink-0 text-xs font-bold text-amber-800 hover:text-amber-950 bg-white border border-amber-300 hover:border-amber-400 px-2.5 py-1 rounded-lg transition cursor-pointer"
-                  >
-                    {obstacleInput.trim() ? "壁を修正・再計算" : "＋ できない理由を追加"}
-                  </button>
-                </div>
-              ) : (
-                <div className="bg-amber-50 border-2 border-amber-300 rounded-2xl p-3.5 sm:p-4 shadow-sm space-y-2.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-xs font-bold text-amber-950">
-                      🚧 立ちはだかる壁を追加・修正して迂回ルートを引き直す
-                    </span>
-                    <div className="flex items-center gap-2.5 shrink-0">
-                      <RemainingChars
-                        current={obstacleInput.length}
-                        max={MAX_OBSTACLE_LENGTH}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setIsDetourOpen(false)}
-                        className="text-xs text-slate-500 hover:text-slate-700 cursor-pointer"
-                      >
-                        閉じる
-                      </button>
-                    </div>
-                  </div>
-                  <input
-                    type="text"
-                    maxLength={MAX_OBSTACLE_LENGTH}
-                    value={obstacleInput}
-                    onChange={(e) =>
-                      setObstacleInput(e.target.value.slice(0, MAX_OBSTACLE_LENGTH))
-                    }
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        generateRoute(goalInput, obstacleInput, false);
-                      }
-                    }}
-                    placeholder="例：電車に乗れない、外に出るのが怖い…"
-                    className="w-full rounded-xl border border-amber-300 bg-white px-3 py-2 text-xs sm:text-sm text-slate-800 focus:border-amber-500 focus:outline-none"
-                  />
-                  <div className="flex flex-wrap gap-1.5">
-                    {OBSTACLE_PRESETS.map((chip) => {
-                      const isSelected = obstacleInput.includes(chip);
-                      const isDisabled = !isSelected && !canAppendObstacleChip(chip);
-                      return (
-                        <button
-                          key={chip}
-                          type="button"
-                          disabled={isDisabled}
-                          onClick={() => toggleObstaclePreset(chip)}
-                          className={`text-[11px] px-2 py-1 rounded-md border transition disabled:opacity-40 cursor-pointer disabled:cursor-not-allowed ${
-                            isSelected
-                              ? "bg-amber-200 border-amber-500 text-amber-950 font-semibold"
-                              : "bg-white text-slate-600 border-amber-200 hover:bg-amber-100/60"
-                          }`}
-                        >
-                          {isSelected ? `✓ ${chip}` : `＋ ${chip}`}
-                        </button>
-                      );
-                    })}
-                  </div>
-                  <div className="flex justify-end gap-2 pt-1">
-                    <button
-                      type="button"
-                      onClick={() => generateRoute(goalInput, obstacleInput, false)}
-                      className="text-xs font-bold bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-xl shadow-sm transition cursor-pointer"
-                    >
-                      この条件で迂回ルートを再計算
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div className="relative bg-gradient-to-br from-amber-50 via-white to-sky-50 border-2 border-amber-400 rounded-2xl p-4 sm:p-5 shadow-sm">
-              <div className="flex flex-wrap items-center justify-between gap-2 mb-1.5">
-                <div className="flex items-center gap-1.5">
-                  <span className="inline-flex items-center gap-1 text-xs font-bold text-amber-800 bg-amber-200/80 px-2.5 py-0.5 rounded-full">
-                    🚩 山頂（最終地点）
-                  </span>
-                  {routeData.route_badge && (
-                    <span className="text-[11px] font-bold text-emerald-800 bg-emerald-100 border border-emerald-200 px-2 py-0.5 rounded-full">
-                      🧭 {routeData.route_badge}
-                    </span>
-                  )}
-                </div>
-                <button
-                  type="button"
-                  onClick={() => generateRoute(goalInput, obstacleInput, true)}
-                  className="text-xs text-slate-400 hover:text-emerald-700 underline underline-offset-2 transition cursor-pointer"
-                >
-                  別ルートで引き直す
-                </button>
-              </div>
-              <h2 className="text-base sm:text-lg font-extrabold text-slate-900">
-                {routeData.summit_vision}
-              </h2>
-              <p className="text-xs text-slate-500 mt-1">目標：{goalInput}</p>
-            </div>
-
-            {descendingCheckpoints.map((cp, index) => (
-              <React.Fragment key={`${cp.stage}-${index}`}>
-                <ClimbArrowUp />
-                <div className="bg-white border border-slate-200 rounded-2xl p-3.5 sm:p-4 shadow-sm flex items-start gap-3">
-                  <span className="shrink-0 text-xs font-extrabold text-emerald-800 bg-emerald-100 border border-emerald-200 px-2.5 py-1 rounded-lg mt-0.5">
-                    {cp.stage}
-                  </span>
-                  <div className="min-w-0">
-                    <h3 className="text-sm font-bold text-slate-800">{cp.title}</h3>
-                    <p className="text-xs text-slate-500 mt-0.5 leading-relaxed">{cp.detail}</p>
-                  </div>
-                </div>
-              </React.Fragment>
-            ))}
-
-            <ClimbArrowUp label="ここから登り始める" />
-
-            <div
-              className={`rounded-2xl p-4 sm:p-5 border-2 transition ${
-                branch === "plan_a"
-                  ? "bg-emerald-50/80 border-emerald-500 shadow-md"
-                  : branch === "plan_b"
-                  ? "bg-slate-100/80 border-slate-200 opacity-65"
-                  : "bg-white border-emerald-400 shadow-sm"
-              }`}
-            >
-              <div className="flex items-center justify-between gap-2 mb-1.5">
-                <span className="text-xs font-extrabold tracking-wide text-white bg-emerald-600 px-2.5 py-0.5 rounded-full">
-                  📍 現在地（麓）：最初の一歩
-                </span>
-                <span className="text-xs font-medium text-slate-500">
-                  目安：{routeData.plan_a.duration}
-                </span>
-              </div>
-              <p className="text-base font-bold text-slate-900 mt-1">
-                {routeData.plan_a.action}
-              </p>
-
-              {branch === "plan_a" && (
-                <div className="mt-4 pt-3 border-t border-emerald-200 flex items-center justify-between gap-2">
-                  <span className="text-xs text-emerald-900 font-medium">
-                    {completed === "plan_a"
-                      ? "1合目クリア！素晴らしい一歩です。"
-                      : "山頂を見上げつつ、まずはこれだけ"}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setCompleted(completed === "plan_a" ? "none" : "plan_a")
-                    }
-                    className={`shrink-0 text-xs font-bold px-3.5 py-1.5 rounded-lg transition cursor-pointer ${
-                      completed === "plan_a"
-                        ? "bg-emerald-600 text-white"
-                        : "bg-white border border-emerald-400 text-emerald-700 hover:bg-emerald-50"
-                    }`}
-                  >
-                    {completed === "plan_a" ? "✓ 一歩踏み出した！" : "完了にする"}
-                  </button>
-                </div>
-              )}
-            </div>
-
-            <div className="pt-2">
-              <div className="bg-amber-50/80 border border-amber-200 rounded-2xl p-4 text-center">
-                <p className="text-sm font-bold text-amber-950 mb-3">
-                  今、この一歩を踏み出せそう？
-                </p>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setBranch("plan_a");
-                      if (completed !== "plan_a") setCompleted("none");
-                    }}
-                    className={`py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold border-2 transition cursor-pointer ${
-                      branch === "plan_a"
-                        ? "bg-emerald-600 border-emerald-600 text-white shadow-sm"
-                        : "bg-white border-emerald-200 text-emerald-800 hover:border-emerald-400"
-                    }`}
-                  >
-                    踏み出せる！（このルートへ）
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setBranch("plan_b");
-                      if (completed === "plan_a") setCompleted("none");
-                    }}
-                    className={`py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold border-2 transition cursor-pointer ${
-                      branch === "plan_b"
-                        ? "bg-amber-600 border-amber-600 text-white shadow-sm"
-                        : "bg-white border-amber-300 text-amber-900 hover:border-amber-500"
-                    }`}
-                  >
-                    今は足が重い…（プランBへ迂回）
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {branch === "plan_b" && (
-              <div className="pt-1">
-                <div className="flex justify-center" aria-hidden="true">
-                  <svg className="w-64 h-7 text-amber-400" viewBox="0 0 256 28" fill="none">
-                    <path
-                      d="M128 0 V10 H48 V28 M128 10 H208 V28"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                    />
-                  </svg>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div
-                    className={`rounded-2xl p-4 border-2 transition flex flex-col justify-between ${
-                      completed === "b_micro"
-                        ? "bg-sky-50 border-sky-500 shadow-sm"
-                        : "bg-white border-sky-200"
-                    }`}
-                  >
-                    <div>
-                      <span className="inline-block text-xs font-bold text-sky-700 bg-sky-100 px-2.5 py-0.5 rounded-full mb-2">
-                        迂回B-1：1分だけ進む
-                      </span>
-                      <p className="text-sm font-bold text-slate-900">
-                        {routeData.plan_b_micro.action}
-                      </p>
-                      <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
-                        {routeData.plan_b_micro.reason}
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setCompleted(completed === "b_micro" ? "none" : "b_micro")
-                      }
-                      className={`mt-4 w-full py-2 rounded-xl text-xs font-bold border transition cursor-pointer ${
-                        completed === "b_micro"
-                          ? "bg-sky-600 border-sky-600 text-white"
-                          : "bg-sky-50 border-sky-200 text-sky-800 hover:bg-sky-100"
-                      }`}
-                    >
-                      {completed === "b_micro" ? "✓ 1分前進完了！" : "これならできた！"}
-                    </button>
-                  </div>
-
-                  <div
-                    className={`rounded-2xl p-4 border-2 transition flex flex-col justify-between ${
-                      completed === "b_rest"
-                        ? "bg-teal-50 border-teal-500 shadow-sm"
-                        : "bg-white border-teal-200"
-                    }`}
-                  >
-                    <div>
-                      <span className="inline-block text-xs font-bold text-teal-700 bg-teal-100 px-2.5 py-0.5 rounded-full mb-2">
-                        待機B-2：天候回復待ち（休息）
-                      </span>
-                      <p className="text-sm font-bold text-slate-900">
-                        {routeData.plan_b_rest.action}
-                      </p>
-                      <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
-                        {routeData.plan_b_rest.reason}
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setCompleted(completed === "b_rest" ? "none" : "b_rest")
-                      }
-                      className={`mt-4 w-full py-2 rounded-xl text-xs font-bold border transition cursor-pointer ${
-                        completed === "b_rest"
-                          ? "bg-teal-600 border-teal-600 text-white"
-                          : "bg-teal-50 border-teal-200 text-teal-800 hover:bg-teal-100"
-                      }`}
-                    >
-                      {completed === "b_rest" ? "✓ ベースキャンプで休息中" : "堂々と休む！"}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            <section className="pt-5">
-              <div className="bg-white border border-slate-200 rounded-2xl p-4 sm:p-5 shadow-sm space-y-4">
-                <div className="flex items-center justify-between gap-2">
-                  <div>
-                    <h3 className="text-sm font-bold text-slate-900 flex items-center gap-1.5">
-                      <span>💬</span>
-                      <span>るーと君にさらに相談する（具体的な動き方を聞く）</span>
-                    </h3>
-                    <p className="text-xs text-slate-500 mt-0.5">
-                      「何て検索すればいい？」「メールの文面は？」など、迷う点を聞くと具体的な行動を提案します。
-                    </p>
-                  </div>
-                  {consultHistory.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => setConsultHistory([])}
-                      className="shrink-0 text-[11px] text-slate-400 hover:text-slate-600 cursor-pointer"
-                    >
-                      履歴クリア
-                    </button>
-                  )}
-                </div>
-
-                {consultHistory.length > 0 && (
-                  <div className="space-y-3 pt-1">
-                    {consultHistory.map((item) => (
-                      <div
-                        key={item.id}
-                        className="bg-slate-50/90 border border-slate-200/80 rounded-xl p-3.5 space-y-2.5"
-                      >
-                        <div className="flex items-start gap-2">
-                          <span className="shrink-0 text-[10px] font-bold bg-slate-200 text-slate-700 px-2 py-0.5 rounded">
-                            あなた
-                          </span>
-                          <p className="text-xs sm:text-sm font-semibold text-slate-800">
-                            {item.question}
-                          </p>
-                        </div>
-
-                        <div className="pl-2 border-l-2 border-emerald-400 space-y-2">
-                          <p className="text-xs sm:text-sm text-slate-700 leading-relaxed">
-                            {item.advice}
-                          </p>
-
-                          <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
-                            <p className="text-[11px] font-extrabold text-emerald-800 mb-1">
-                              ✨ こうしたらいいよ！（具体的な行動）
-                            </p>
-                            <p className="text-xs sm:text-sm font-bold text-slate-900 leading-relaxed select-all">
-                              {item.concrete_action}
-                            </p>
-                            {item.action_tip && (
-                              <p className="text-[11px] text-emerald-700 mt-1.5">
-                                💡 {item.action_tip}
-                              </p>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {consultError && (
-                  <p className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
-                    {consultError}
-                  </p>
-                )}
-
-                <div className="flex flex-wrap gap-1.5">
-                  {CONSULT_PRESETS.map((preset) => (
-                    <button
-                      key={preset}
-                      type="button"
-                      disabled={consultLoading}
-                      onClick={() => handleAskConsult(preset)}
-                      className="text-xs bg-slate-100 hover:bg-emerald-50 text-slate-600 hover:text-emerald-700 border border-transparent hover:border-emerald-200 px-2.5 py-1.5 rounded-lg transition disabled:opacity-50 cursor-pointer"
-                    >
-                      {preset}
-                    </button>
-                  ))}
-                </div>
-
-                <div className="space-y-1">
-                  <div className="flex justify-end">
-                    <RemainingChars
-                      current={consultInput.length}
-                      max={MAX_CONSULT_LENGTH}
-                    />
-                  </div>
-                  <div className="flex gap-2">
-                    <input
-                      type="text"
-                      maxLength={MAX_CONSULT_LENGTH}
-                      value={consultInput}
-                      onChange={(e) =>
-                        setConsultInput(e.target.value.slice(0, MAX_CONSULT_LENGTH))
-                      }
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") {
-                          e.preventDefault();
-                          handleAskConsult(consultInput);
-                        }
-                      }}
-                      placeholder="例：問い合わせの文章を作って、どこを見ればいい？…"
-                      className="flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2 text-xs sm:text-sm text-slate-800 placeholder:text-slate-400 focus:bg-white focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 transition"
-                    />
-                    <button
-                      type="button"
-                      disabled={!consultInput.trim() || consultLoading}
-                      onClick={() => handleAskConsult(consultInput)}
-                      className="shrink-0 inline-flex items-center justify-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white font-semibold text-xs sm:text-sm px-4 py-2 rounded-xl shadow-sm transition cursor-pointer disabled:cursor-not-allowed"
-                    >
-                      {consultLoading ? (
-                        <>
-                          <span className="h-3.5 w-3.5 border-2 border-white/40 border-t-white rounded-full animate-spin" />
-                          考え中…
-                        </>
-                      ) : (
-                        "聞く"
-                      )}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </section>
-          </div>
-        )}
-      </div>
-    </main>
-  );
-}
