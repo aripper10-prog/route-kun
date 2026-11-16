@@ -27,6 +27,14 @@ interface RouteData {
   };
 }
 
+interface ConsultEntry {
+  id: string;
+  question: string;
+  advice: string;
+  concrete_action: string;
+  action_tip: string;
+}
+
 type BranchChoice = "none" | "plan_a" | "plan_b";
 type CompletedChoice = "none" | "plan_a" | "b_micro" | "b_rest";
 
@@ -36,9 +44,15 @@ interface SavedState {
   routeData: RouteData | null;
   branch: BranchChoice;
   completed: CompletedChoice;
+  consultHistory: ConsultEntry[];
 }
 
-const STORAGE_KEY = "route_kun_mountain_v2";
+const STORAGE_KEY = "route_kun_mountain_v3";
+
+// サーバー側（src/lib/guard.ts）と合わせた文字数上限
+const MAX_GOAL_LENGTH = 100;
+const MAX_OBSTACLE_LENGTH = 150;
+const MAX_CONSULT_LENGTH = 200;
 
 const GOAL_PRESETS = [
   "就労移行事業所に通う",
@@ -53,6 +67,12 @@ const OBSTACLE_PRESETS = [
   "電話や手続き・対人連絡が怖い",
   "何から手をつければいいか分からない",
   "お金や時間に余裕がない",
+];
+
+const CONSULT_PRESETS = [
+  "最初の一歩、具体的に何て検索すればいい？",
+  "不安で手が止まる時はどうしたらいい？",
+  "もっと負荷を下げたやり方を教えて",
 ];
 
 function ClimbArrowUp({ label }: { label?: string }) {
@@ -73,6 +93,20 @@ function ClimbArrowUp({ label }: { label?: string }) {
   );
 }
 
+function RemainingChars({ current, max }: { current: number; max: number }) {
+  const remaining = Math.max(0, max - current);
+  const isLow = remaining <= 15;
+  return (
+    <span
+      className={`text-[11px] tabular-nums ${
+        isLow ? "text-amber-600 font-semibold" : "text-slate-400"
+      }`}
+    >
+      あと {remaining}文字
+    </span>
+  );
+}
+
 export default function RouteKunPage() {
   const [goalInput, setGoalInput] = useState("");
   const [obstacleInput, setObstacleInput] = useState("");
@@ -86,17 +120,28 @@ export default function RouteKunPage() {
   // チャート表示後の「後出し迂回再計算」パネル開閉
   const [isDetourOpen, setIsDetourOpen] = useState(false);
 
+  // 追加質問・具体策相談用のステート
+  const [consultInput, setConsultInput] = useState("");
+  const [consultHistory, setConsultHistory] = useState<ConsultEntry[]>([]);
+  const [consultLoading, setConsultLoading] = useState(false);
+  const [consultError, setConsultError] = useState<string | null>(null);
+
   // 初回マウント時にlocalStorageから復元
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const saved: SavedState = JSON.parse(raw);
-        if (saved.goalInput) setGoalInput(saved.goalInput);
-        if (saved.obstacleInput) setObstacleInput(saved.obstacleInput);
+        if (saved.goalInput) setGoalInput(saved.goalInput.slice(0, MAX_GOAL_LENGTH));
+        if (saved.obstacleInput) {
+          setObstacleInput(saved.obstacleInput.slice(0, MAX_OBSTACLE_LENGTH));
+        }
         if (saved.routeData) setRouteData(saved.routeData);
         if (saved.branch) setBranch(saved.branch);
         if (saved.completed) setCompleted(saved.completed);
+        if (Array.isArray(saved.consultHistory)) {
+          setConsultHistory(saved.consultHistory);
+        }
       }
     } catch {
       // 読み込み失敗時は初期状態のまま
@@ -115,12 +160,24 @@ export default function RouteKunPage() {
         routeData,
         branch,
         completed,
+        consultHistory,
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToSave));
     } catch {
       // 保存容量制限等は無視
     }
-  }, [goalInput, obstacleInput, routeData, branch, completed, hydrated]);
+  }, [goalInput, obstacleInput, routeData, branch, completed, consultHistory, hydrated]);
+
+  // 「できない理由」チップ追加時に上限を超えるか判定
+  const canAppendObstacleChip = (chip: string) => {
+    if (obstacleInput.includes(chip)) return true;
+    const parts = obstacleInput
+      .split("／")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const next = [...parts, chip].join(" ／ ");
+    return next.length <= MAX_OBSTACLE_LENGTH;
+  };
 
   // 「できない理由」チップのトグル（複数追加・解除が可能）
   const toggleObstaclePreset = (chip: string) => {
@@ -132,7 +189,9 @@ export default function RouteKunPage() {
       if (parts.includes(chip)) {
         return parts.filter((p) => p !== chip).join(" ／ ");
       }
-      return [...parts, chip].join(" ／ ");
+      const next = [...parts, chip].join(" ／ ");
+      if (next.length > MAX_OBSTACLE_LENGTH) return prev;
+      return next;
     });
   };
 
@@ -141,14 +200,16 @@ export default function RouteKunPage() {
     targetObstacle: string,
     isRegenerate = false
   ) => {
-    const trimmedGoal = targetGoal.trim();
-    const trimmedObstacle = targetObstacle.trim();
+    const trimmedGoal = targetGoal.trim().slice(0, MAX_GOAL_LENGTH);
+    const trimmedObstacle = targetObstacle.trim().slice(0, MAX_OBSTACLE_LENGTH);
     if (!trimmedGoal || loading) return;
 
     setLoading(true);
     setError(null);
     setBranch("none");
     setCompleted("none");
+    setConsultHistory([]);
+    setConsultError(null);
 
     try {
       const res = await fetch("/api/generate", {
@@ -175,9 +236,59 @@ export default function RouteKunPage() {
     }
   };
 
+  // 追加相談の送信
+  const handleAskConsult = async (targetQuestion: string) => {
+    const trimmedQ = targetQuestion.trim().slice(0, MAX_CONSULT_LENGTH);
+    if (!trimmedQ || !routeData || consultLoading) return;
+
+    setConsultLoading(true);
+    setConsultError(null);
+
+    try {
+      const res = await fetch("/api/consult", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question: trimmedQ,
+          goalInput: goalInput.trim().slice(0, MAX_GOAL_LENGTH),
+          obstacle: obstacleInput.trim().slice(0, MAX_OBSTACLE_LENGTH),
+          routeData,
+          history: consultHistory.map((h) => ({
+            question: h.question,
+            advice: h.advice,
+            concrete_action: h.concrete_action,
+          })),
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "回答の取得に失敗しました。");
+      }
+
+      const newEntry: ConsultEntry = {
+        id: `${Date.now()}`,
+        question: trimmedQ,
+        advice: data.advice,
+        concrete_action: data.concrete_action,
+        action_tip: data.action_tip,
+      };
+
+      setConsultHistory((prev) => [...prev, newEntry]);
+      setConsultInput("");
+    } catch (err) {
+      setConsultError(
+        err instanceof Error ? err.message : "通信エラーが発生しました。"
+      );
+    } finally {
+      setConsultLoading(false);
+    }
+  };
+
   const handleGoalPresetClick = (preset: string) => {
-    setGoalInput(preset);
-    generateRoute(preset, obstacleInput, false);
+    const clipped = preset.slice(0, MAX_GOAL_LENGTH);
+    setGoalInput(clipped);
+    generateRoute(clipped, obstacleInput, false);
   };
 
   const handleClear = () => {
@@ -188,6 +299,9 @@ export default function RouteKunPage() {
     setCompleted("none");
     setError(null);
     setIsDetourOpen(false);
+    setConsultHistory([]);
+    setConsultInput("");
+    setConsultError(null);
     localStorage.removeItem(STORAGE_KEY);
   };
 
@@ -228,14 +342,18 @@ export default function RouteKunPage() {
         <section className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 sm:p-5 mb-6 space-y-5">
           {/* ① 最終地点（山頂） */}
           <div>
-            <label htmlFor="goal-input" className="block text-sm font-bold text-slate-800 mb-1">
-              1. たどり着きたい最終地点（山頂）は？
-            </label>
+            <div className="flex items-center justify-between mb-1">
+              <label htmlFor="goal-input" className="text-sm font-bold text-slate-800">
+                1. たどり着きたい最終地点（山頂）は？
+              </label>
+              <RemainingChars current={goalInput.length} max={MAX_GOAL_LENGTH} />
+            </div>
             <input
               id="goal-input"
               type="text"
+              maxLength={MAX_GOAL_LENGTH}
               value={goalInput}
-              onChange={(e) => setGoalInput(e.target.value)}
+              onChange={(e) => setGoalInput(e.target.value.slice(0, MAX_GOAL_LENGTH))}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   e.preventDefault();
@@ -263,22 +381,25 @@ export default function RouteKunPage() {
 
           {/* ② 立ちはだかる壁・できない理由（任意） */}
           <div className="pt-4 border-t border-slate-100">
-            <div className="flex items-center justify-between mb-1">
+            <div className="flex items-center justify-between mb-1 gap-2">
               <label htmlFor="obstacle-input" className="text-sm font-bold text-slate-800">
                 2. いま立ちはだかる壁・できない理由
                 <span className="ml-2 text-[11px] font-medium text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">
                   任意
                 </span>
               </label>
-              {obstacleInput && (
-                <button
-                  type="button"
-                  onClick={() => setObstacleInput("")}
-                  className="text-[11px] text-slate-400 hover:text-slate-600 cursor-pointer"
-                >
-                  壁をクリア
-                </button>
-              )}
+              <div className="flex items-center gap-2.5 shrink-0">
+                {obstacleInput && (
+                  <button
+                    type="button"
+                    onClick={() => setObstacleInput("")}
+                    className="text-[11px] text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    壁をクリア
+                  </button>
+                )}
+                <RemainingChars current={obstacleInput.length} max={MAX_OBSTACLE_LENGTH} />
+              </div>
             </div>
             <p className="text-xs text-slate-500 mb-2">
               事情を入れると、その壁にぶつからない<strong className="text-emerald-700 font-semibold">迂回ルート（別の登山口）</strong>を引きます。
@@ -286,8 +407,11 @@ export default function RouteKunPage() {
             <input
               id="obstacle-input"
               type="text"
+              maxLength={MAX_OBSTACLE_LENGTH}
               value={obstacleInput}
-              onChange={(e) => setObstacleInput(e.target.value)}
+              onChange={(e) =>
+                setObstacleInput(e.target.value.slice(0, MAX_OBSTACLE_LENGTH))
+              }
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   e.preventDefault();
@@ -302,13 +426,14 @@ export default function RouteKunPage() {
             <div className="mt-2 flex flex-wrap gap-1.5">
               {OBSTACLE_PRESETS.map((chip) => {
                 const isSelected = obstacleInput.includes(chip);
+                const isDisabled = loading || (!isSelected && !canAppendObstacleChip(chip));
                 return (
                   <button
                     key={chip}
                     type="button"
-                    disabled={loading}
+                    disabled={isDisabled}
                     onClick={() => toggleObstaclePreset(chip)}
-                    className={`text-xs px-2.5 py-1 rounded-lg border transition disabled:opacity-50 cursor-pointer ${
+                    className={`text-xs px-2.5 py-1 rounded-lg border transition disabled:opacity-40 cursor-pointer disabled:cursor-not-allowed ${
                       isSelected
                         ? "bg-amber-100 border-amber-400 text-amber-900 font-semibold"
                         : "bg-slate-50 hover:bg-amber-50/70 text-slate-600 border-slate-200/80 hover:border-amber-200"
@@ -393,22 +518,31 @@ export default function RouteKunPage() {
                 </div>
               ) : (
                 <div className="bg-amber-50 border-2 border-amber-300 rounded-2xl p-3.5 sm:p-4 shadow-sm space-y-2.5">
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-2">
                     <span className="text-xs font-bold text-amber-950">
                       🚧 立ちはだかる壁を追加・修正して迂回ルートを引き直す
                     </span>
-                    <button
-                      type="button"
-                      onClick={() => setIsDetourOpen(false)}
-                      className="text-xs text-slate-500 hover:text-slate-700 cursor-pointer"
-                    >
-                      閉じる
-                    </button>
+                    <div className="flex items-center gap-2.5 shrink-0">
+                      <RemainingChars
+                        current={obstacleInput.length}
+                        max={MAX_OBSTACLE_LENGTH}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setIsDetourOpen(false)}
+                        className="text-xs text-slate-500 hover:text-slate-700 cursor-pointer"
+                      >
+                        閉じる
+                      </button>
+                    </div>
                   </div>
                   <input
                     type="text"
+                    maxLength={MAX_OBSTACLE_LENGTH}
                     value={obstacleInput}
-                    onChange={(e) => setObstacleInput(e.target.value)}
+                    onChange={(e) =>
+                      setObstacleInput(e.target.value.slice(0, MAX_OBSTACLE_LENGTH))
+                    }
                     onKeyDown={(e) => {
                       if (e.key === "Enter") {
                         e.preventDefault();
@@ -421,12 +555,14 @@ export default function RouteKunPage() {
                   <div className="flex flex-wrap gap-1.5">
                     {OBSTACLE_PRESETS.map((chip) => {
                       const isSelected = obstacleInput.includes(chip);
+                      const isDisabled = !isSelected && !canAppendObstacleChip(chip);
                       return (
                         <button
                           key={chip}
                           type="button"
+                          disabled={isDisabled}
                           onClick={() => toggleObstaclePreset(chip)}
-                          className={`text-[11px] px-2 py-1 rounded-md border transition cursor-pointer ${
+                          className={`text-[11px] px-2 py-1 rounded-md border transition disabled:opacity-40 cursor-pointer disabled:cursor-not-allowed ${
                             isSelected
                               ? "bg-amber-200 border-amber-500 text-amber-950 font-semibold"
                               : "bg-white text-slate-600 border-amber-200 hover:bg-amber-100/60"
@@ -665,9 +801,75 @@ export default function RouteKunPage() {
                 </div>
               </div>
             )}
-          </div>
-        )}
-      </div>
-    </main>
-  );
-}
+
+            {/* 🧭 るーと君への追加相談＆具体的アクション提案セクション */}
+            <section className="pt-5">
+              <div className="bg-white border border-slate-200 rounded-2xl p-4 sm:p-5 shadow-sm space-y-4">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-sm font-bold text-slate-900 flex items-center gap-1.5">
+                      <span>💬</span>
+                      <span>るーと君にさらに相談する（具体的な動き方を聞く）</span>
+                    </h3>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      「何て検索すればいい？」「メールの文面は？」など、迷う点を聞くと具体的な行動を提案します。
+                    </p>
+                  </div>
+                  {consultHistory.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setConsultHistory([])}
+                      className="shrink-0 text-[11px] text-slate-400 hover:text-slate-600 cursor-pointer"
+                    >
+                      履歴クリア
+                    </button>
+                  )}
+                </div>
+
+                {/* 過去の追加相談＆回答リスト */}
+                {consultHistory.length > 0 && (
+                  <div className="space-y-3 pt-1">
+                    {consultHistory.map((item) => (
+                      <div
+                        key={item.id}
+                        className="bg-slate-50/90 border border-slate-200/80 rounded-xl p-3.5 space-y-2.5"
+                      >
+                        {/* ユーザーの質問 */}
+                        <div className="flex items-start gap-2">
+                          <span className="shrink-0 text-[10px] font-bold bg-slate-200 text-slate-700 px-2 py-0.5 rounded">
+                            あなた
+                          </span>
+                          <p className="text-xs sm:text-sm font-semibold text-slate-800">
+                            {item.question}
+                          </p>
+                        </div>
+
+                        {/* るーと君の回答 */}
+                        <div className="pl-2 border-l-2 border-emerald-400 space-y-2">
+                          <p className="text-xs sm:text-sm text-slate-700 leading-relaxed">
+                            {item.advice}
+                          </p>
+
+                          {/* 具体的な行動ハイライトボックス */}
+                          <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
+                            <p className="text-[11px] font-extrabold text-emerald-800 mb-1">
+                              ✨ こうしたらいいよ！（具体的な行動）
+                            </p>
+                            <p className="text-xs sm:text-sm font-bold text-slate-900 leading-relaxed select-all">
+                              {item.concrete_action}
+                            </p>
+                            {item.action_tip && (
+                              <p className="text-[11px] text-emerald-700 mt-1.5">
+                                💡 {item.action_tip}
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* エラー表示 */}
+                {consultError && (
+                  <p className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-
