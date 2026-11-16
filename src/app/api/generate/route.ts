@@ -1,4 +1,11 @@
 import { NextResponse } from "next/server";
+import {
+  checkSecurity,
+  sanitizeUserText,
+  needsImmediateRest,
+  createRestPriorityRoute,
+  SECURITY_SYSTEM_GUARD,
+} from "@/lib/guard";
 
 const GEMINI_API_URL =
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
@@ -90,6 +97,10 @@ const responseSchema = {
 };
 
 export async function POST(req: Request) {
+  // 1. Originチェック＆IPベースの連打制限
+  const blocked = checkSecurity(req);
+  if (blocked) return blocked;
+
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
@@ -100,10 +111,11 @@ export async function POST(req: Request) {
 
   try {
     const body = await req.json();
-    const goalInput = typeof body.goalInput === "string" ? body.goalInput.trim() : "";
-    const obstacle = typeof body.obstacle === "string" ? body.obstacle.trim() : "";
-    const previousPlan =
-      typeof body.previousPlan === "string" ? body.previousPlan.trim() : "";
+
+    // 2. 入力データの無害化（タグ除去＋文字数制限）
+    const goalInput = sanitizeUserText(body.goalInput, 100);
+    const obstacle = sanitizeUserText(body.obstacle, 150);
+    const previousPlan = sanitizeUserText(body.previousPlan, 100);
 
     if (!goalInput) {
       return NextResponse.json(
@@ -112,7 +124,15 @@ export async function POST(req: Request) {
       );
     }
 
-    const systemInstruction = `あなたは焦燥・迷走思考整理ツール「るーと君」の登山ガイドです。
+    // 3. 限界サイン検知時はAIを通さず「休息優先ルート」を即座に返す
+    if (needsImmediateRest(goalInput, obstacle)) {
+      return NextResponse.json(createRestPriorityRoute());
+    }
+
+    // 4. 最優先の防御プロンプトを先頭に配置
+    const systemInstruction = `${SECURITY_SYSTEM_GUARD}
+
+あなたは焦燥・迷走思考整理ツール「るーと君」の登山ガイドです。
 ユーザーが入力した「最終地点（山頂）」から逆算（バックキャスト）し、現在地（麓）から無理なく登るための登山ルートを作成してください。
 
 【最重要ルール：立ちはだかる壁（できない理由）への配慮】
@@ -120,18 +140,15 @@ export async function POST(req: Request) {
 代わりに、在宅・オンライン・テキスト連絡・第三者サポート・超スモールステップなど、その制約を抱えたままでも登れる「現実的な迂回ルート（別の登山口）」を設計してください。
 
 【トーン＆フォーマット】
-- 説教・根性論・無理な励ましは禁止。穏やかで頼もしい山の案内人のように寄り添うこと。
+- 説教・根性論・無理な励ましは禁止。穏やかで頼もしい山の案内人のようなトーンで寄り添うこと。
 - checkpointsは必ず「2合目 → 5合目 → 8合目」の順で3要素出力すること。`;
 
-    let userPrompt = `目指す最終地点（山頂）：「${goalInput}」`;
-    if (obstacle) {
-      userPrompt += `\nいま立ちはだかる壁（できない理由・制約）：「${obstacle}」`;
-    } else {
-      userPrompt += `\nいま立ちはだかる壁：特になし（ただし焦りや迷いがあるため無理のない歩幅で）`;
-    }
-    if (previousPlan) {
-      userPrompt += `\n※前回は最初の一歩として「${previousPlan}」を提案しました。今回は別の切り口や異なる迂回アプローチで新しいルートを作成してください。`;
-    }
+    // 5. ユーザー由来のデータを <user_input> タグ内に隔離
+    const userPrompt = `<user_input>
+  <goal>${goalInput}</goal>
+  <obstacle>${obstacle || "特になし（ただし焦りや迷いがあるため無理のない歩幅で）"}</obstacle>
+  ${previousPlan ? `<previous_plan>\${previousPlan}</previous_plan>` : ""}
+</user_input>`;
 
     const res = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
       method: "POST",
