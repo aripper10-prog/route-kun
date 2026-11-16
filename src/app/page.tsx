@@ -420,4 +420,254 @@ export default function RouteKunPage() {
                   />
                   <div className="flex flex-wrap gap-1.5">
                     {OBSTACLE_PRESETS.map((chip) => {
-                      const isSelected = obstacleInput
+                      const isSelected = obstacleInput.includes(chip);
+                      return (
+                        <button
+                          key={chip}
+                          type="button"
+                          onClick={() => toggleObstaclePreset(chip)}
+                          className={`text-[11px] px-2 py-1 rounded-md border transition cursor-pointer ${
+                            isSelected
+                              ? "bg-amber-200 border-amber-500 text-amber-950 font-semibold"
+                              : "bg-white text-slate-600 border-amber-200 hover:bg-amber-100/60"
+                          }`}
+                        >
+                          {isSelected ? `✓ ${chip}` : `＋ ${chip}`}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="flex justify-end gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => generateRoute(goalInput, obstacleInput, false)}
+                      className="text-xs font-bold bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-xl shadow-sm transition cursor-pointer"
+                    >
+                      この条件で迂回ルートを再計算
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* 頂上：最終地点（GOAL） */}
+            <div className="relative bg-gradient-to-br from-amber-50 via-white to-sky-50 border-2 border-amber-400 rounded-2xl p-4 sm:p-5 shadow-sm">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-1.5">
+                <div className="flex items-center gap-1.5">
+                  <span className="inline-flex items-center gap-1 text-xs font-bold text-amber-800 bg-amber-200/80 px-2.5 py-0.5 rounded-full">
+                    🚩 山頂（最終地点）
+                  </span>
+                  {routeData.route_badge && (
+                    <span className="text-[11px] font-bold text-emerald-800 bg-emerald-100 border border-emerald-200 px-2 py-0.5 rounded-full">
+                      🧭 {routeData.route_badge}
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => generateRoute(goalInput, obstacleInput, true)}
+                  className="text-xs text-slate-400 hover:text-emerald-700 underline underline-offset-2 transition cursor-pointer"
+                >
+                  別ルートで引き直す
+                </button>
+              </div>
+              <h2 className="text-base sm:text-lg font-extrabold text-slate-900">
+                {routeData.summit_vision}
+              </h2>
+              <p className="text-xs text-slate-500 mt-1">目標：{goalInput}</p>
+            </div>
+
+            {/* 経由地（上から8合目 → 5合目 → 2合目） */}
+            {descendingCheckpoints.map((cp, index) => (
+              <React.Fragment key={`${cp.stage}-${index}`}>
+                <ClimbArrowUp />
+                <div className="bg-white border border-slate-200 rounded-2xl p-3.5 sm:p-4 shadow-sm flex items-start gap-3">
+                  <span className="shrink-0 text-xs font-extrabold text-emerald-800 bg-emerald-100 border border-emerald-200 px-2.5 py-1 rounded-lg mt-0.5">
+                    {cp.stage}
+                  </span>
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-bold text-slate-800">{cp.title}</h3>
+                    <p className="text-xs text-slate-500 mt-0.5 leading-relaxed">{cp.detail}</p>
+                  </div>
+                </div>
+              </React.Fragment>
+            ))}
+
+            <ClimbArrowUp label="ここから登り始める" />
+
+            {/* 麓・現在地：いますべきこと（プランA） */}
+            <div
+              className={`rounded-2xl p-4 sm:p-5 border-2 transition ${
+                branch === "plan_a"
+                  ? "bg-emerald-50/80 border-emerald-500 shadow-md"
+                  : branch === "plan_b"
+                  ? "bg-slate-100/80 border-slate-200 opacity-65"
+                  : "bg-white border-emerald-400 shadow-sm"
+              }`}
+            >
+              <div className="flex items-center justify-between gap-2 mb-1.5">
+                <span className="text-xs font-extrabold tracking-wide text-white bg-emerald-600 px-2.5 py-0.5 rounded-full">
+                  📍 現在地（麓）：最初の一歩
+                </span>
+                <span className="text-xs font-medium text-slate-500">
+                  目安：{routeData.plan_a.duration}
+                </span>
+              </div>
+              <p className="text-base font-bold text-slate-900 mt-1">
+                {routeData.plan_a.action}
+              </p>
+
+              {/* プランA選択時の完了ボタン */}
+              {branch === "plan_a" && (
+                <div className="mt-4 pt-3 border-t border-emerald-200 flex items-center justify-between gap-2">
+                  <span className="text-xs text-emerald-900 font-medium">
+                    {completed === "plan_a"
+                      ? "1合目クリア！素晴らしい一歩です。"
+                      : "山頂を見上げつつ、まずはこれだけ"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setCompleted(completed === "plan_a" ? "none" : "plan_a")
+                    }
+                    className={`shrink-0 text-xs font-bold px-3.5 py-1.5 rounded-lg transition cursor-pointer ${
+                      completed === "plan_a"
+                        ? "bg-emerald-600 text-white"
+                        : "bg-white border border-emerald-400 text-emerald-700 hover:bg-emerald-50"
+                    }`}
+                  >
+                    {completed === "plan_a" ? "✓ 一歩踏み出した！" : "完了にする"}
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* 分岐チェック */}
+            <div className="pt-2">
+              <div className="bg-amber-50/80 border border-amber-200 rounded-2xl p-4 text-center">
+                <p className="text-sm font-bold text-amber-950 mb-3">
+                  今、この一歩を踏み出せそう？
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setBranch("plan_a");
+                      if (completed !== "plan_a") setCompleted("none");
+                    }}
+                    className={`py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold border-2 transition cursor-pointer ${
+                      branch === "plan_a"
+                        ? "bg-emerald-600 border-emerald-600 text-white shadow-sm"
+                        : "bg-white border-emerald-200 text-emerald-800 hover:border-emerald-400"
+                    }`}
+                  >
+                    踏み出せる！（このルートへ）
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setBranch("plan_b");
+                      if (completed === "plan_a") setCompleted("none");
+                    }}
+                    className={`py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold border-2 transition cursor-pointer ${
+                      branch === "plan_b"
+                        ? "bg-amber-600 border-amber-600 text-white shadow-sm"
+                        : "bg-white border-amber-300 text-amber-900 hover:border-amber-500"
+                    }`}
+                  >
+                    今は足が重い…（プランBへ迂回）
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* プランB分岐展開 */}
+            {branch === "plan_b" && (
+              <div className="pt-1">
+                <div className="flex justify-center" aria-hidden="true">
+                  <svg className="w-64 h-7 text-amber-400" viewBox="0 0 256 28" fill="none">
+                    <path
+                      d="M128 0 V10 H48 V28 M128 10 H208 V28"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                    />
+                  </svg>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {/* 迂回ルートB-1：超・細分化 */}
+                  <div
+                    className={`rounded-2xl p-4 border-2 transition flex flex-col justify-between ${
+                      completed === "b_micro"
+                        ? "bg-sky-50 border-sky-500 shadow-sm"
+                        : "bg-white border-sky-200"
+                    }`}
+                  >
+                    <div>
+                      <span className="inline-block text-xs font-bold text-sky-700 bg-sky-100 px-2.5 py-0.5 rounded-full mb-2">
+                        迂回B-1：1分だけ進む
+                      </span>
+                      <p className="text-sm font-bold text-slate-900">
+                        {routeData.plan_b_micro.action}
+                      </p>
+                      <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
+                        {routeData.plan_b_micro.reason}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCompleted(completed === "b_micro" ? "none" : "b_micro")
+                      }
+                      className={`mt-4 w-full py-2 rounded-xl text-xs font-bold border transition cursor-pointer ${
+                        completed === "b_micro"
+                          ? "bg-sky-600 border-sky-600 text-white"
+                          : "bg-sky-50 border-sky-200 text-sky-800 hover:bg-sky-100"
+                      }`}
+                    >
+                      {completed === "b_micro" ? "✓ 1分前進完了！" : "これならできた！"}
+                    </button>
+                  </div>
+
+                  {/* ベースキャンプB-2：積極的休息 */}
+                  <div
+                    className={`rounded-2xl p-4 border-2 transition flex flex-col justify-between ${
+                      completed === "b_rest"
+                        ? "bg-teal-50 border-teal-500 shadow-sm"
+                        : "bg-white border-teal-200"
+                    }`}
+                  >
+                    <div>
+                      <span className="inline-block text-xs font-bold text-teal-700 bg-teal-100 px-2.5 py-0.5 rounded-full mb-2">
+                        待機B-2：天候回復待ち（休息）
+                      </span>
+                      <p className="text-sm font-bold text-slate-900">
+                        {routeData.plan_b_rest.action}
+                      </p>
+                      <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
+                        {routeData.plan_b_rest.reason}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCompleted(completed === "b_rest" ? "none" : "b_rest")
+                      }
+                      className={`mt-4 w-full py-2 rounded-xl text-xs font-bold border transition cursor-pointer ${
+                        completed === "b_rest"
+                          ? "bg-teal-600 border-teal-600 text-white"
+                          : "bg-teal-50 border-teal-200 text-teal-800 hover:bg-teal-100"
+                      }`}
+                    >
+                      {completed === "b_rest" ? "✓ ベースキャンプで休息中" : "堂々と休む！"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </main>
+  );
+}
