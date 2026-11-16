@@ -7,6 +7,9 @@ import {
   SECURITY_SYSTEM_GUARD,
 } from "@/lib/guard";
 
+// Vercelのデフォルト10秒タイムアウトを回避（Hobbyプランでも最大60秒まで指定可能）
+export const maxDuration = 30;
+
 const GEMINI_API_URL =
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
@@ -30,6 +33,9 @@ const responseSchema = {
     },
     checkpoints: {
       type: "ARRAY",
+      // 必ず3要素（2合目・5合目・8合目）で返るようAPIレベルで強制
+      minItems: 3,
+      maxItems: 3,
       description:
         "麓から山頂に至るまでの3段階の中継地点（必ず配列の0番目を2合目、1番目を5合目、2番目を8合目の順で出力し、立ちはだかる壁にぶつからない代替手段にすること）",
       items: {
@@ -109,13 +115,33 @@ export async function POST(req: Request) {
     );
   }
 
+  // 2. 不正なJSONやオブジェクト以外のボディを 400 Bad Request で弾く
+  let body: Record<string, unknown>;
   try {
-    const body = await req.json();
+    const parsedBody = await req.json();
+    if (!parsedBody || typeof parsedBody !== "object" || Array.isArray(parsedBody)) {
+      return NextResponse.json(
+        { error: "リクエスト形式が正しくありません。" },
+        { status: 400 }
+      );
+    }
+    body = parsedBody as Record<string, unknown>;
+  } catch {
+    return NextResponse.json(
+      { error: "JSONの解析に失敗しました。" },
+      { status: 400 }
+    );
+  }
 
-    // 2. 入力データの無害化（タグ除去＋文字数制限）
-    const goalInput = sanitizeUserText(body.goalInput, 100);
-    const obstacle = sanitizeUserText(body.obstacle, 150);
-    const previousPlan = sanitizeUserText(body.previousPlan, 100);
+  try {
+    // 3. 入力データの型チェック＋無害化（タグ除去＋文字数制限）
+    const rawGoal = typeof body.goalInput === "string" ? body.goalInput : "";
+    const rawObstacle = typeof body.obstacle === "string" ? body.obstacle : "";
+    const rawPrevious = typeof body.previousPlan === "string" ? body.previousPlan : "";
+
+    const goalInput = sanitizeUserText(rawGoal, 100);
+    const obstacle = sanitizeUserText(rawObstacle, 150);
+    const previousPlan = sanitizeUserText(rawPrevious, 100);
 
     if (!goalInput) {
       return NextResponse.json(
@@ -124,12 +150,12 @@ export async function POST(req: Request) {
       );
     }
 
-    // 3. 限界サイン検知時はAIを通さず「休息優先ルート」を即座に返す
+    // 4. 限界サイン検知時はAIを通さず「休息優先ルート」を即座に返す
     if (needsImmediateRest(goalInput, obstacle)) {
       return NextResponse.json(createRestPriorityRoute());
     }
 
-    // 4. 最優先の防御プロンプトを先頭に配置
+    // 5. 最優先の防御プロンプトを先頭に配置
     const systemInstruction = `${SECURITY_SYSTEM_GUARD}
 
 あなたは焦燥・迷走思考整理ツール「るーと君」の登山ガイドです。
@@ -143,16 +169,21 @@ export async function POST(req: Request) {
 - 説教・根性論・無理な励ましは禁止。穏やかで頼もしい山の案内人のようなトーンで寄り添うこと。
 - checkpointsは必ず「2合目 → 5合目 → 8合目」の順で3要素出力すること。`;
 
-    // 5. ユーザー由来のデータを <user_input> タグ内に隔離
+    // 6. ユーザー由来のデータを <user_input> タグ内に隔離（バックスラッシュ修正済み）
     const userPrompt = `<user_input>
   <goal>${goalInput}</goal>
   <obstacle>${obstacle || "特になし（ただし焦りや迷いがあるため無理のない歩幅で）"}</obstacle>
-  ${previousPlan ? `<previous_plan>\${previousPlan}</previous_plan>` : ""}
+  ${previousPlan ? `<previous_plan>${previousPlan}</previous_plan>` : ""}
 </user_input>`;
 
-    const res = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
+    // 7. APIキーはURLではなくヘッダーで渡し、maxDuration(30秒)より手前の25秒でタイムアウト制御
+    const res = await fetch(GEMINI_API_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      signal: AbortSignal.timeout(25000),
       body: JSON.stringify({
         systemInstruction: {
           parts: [{ text: systemInstruction }],
@@ -167,6 +198,8 @@ export async function POST(req: Request) {
           temperature: 0.7,
           responseMimeType: "application/json",
           responseSchema,
+          // 思考プロセスをオフにしてレスポンス速度を高速化
+          thinkingConfig: { thinkingBudget: 0 },
         },
       }),
     });
@@ -193,6 +226,14 @@ export async function POST(req: Request) {
     const parsed = JSON.parse(rawText);
     return NextResponse.json(parsed);
   } catch (err) {
+    if (err instanceof Error && err.name === "TimeoutError") {
+      console.error("Gemini API Timeout");
+      return NextResponse.json(
+        { error: "ルートの生成に時間がかかりすぎています。もう一度お試しください。" },
+        { status: 504 }
+      );
+    }
+
     console.error("Route Handler Error:", err);
     return NextResponse.json(
       { error: "予期しないエラーが発生しました。" },
